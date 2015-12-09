@@ -66,7 +66,7 @@ fn test_integrity() {
 
             // heapify the sane items
             rng.shuffle(&mut panic_ords);
-            let heap = Arc::new(Mutex::new(BinaryHeap::from_vec(panic_ords)));
+            let heap = Arc::new(Mutex::new(BinaryHeap::from(panic_ords)));
             let inner_data;
 
             {
