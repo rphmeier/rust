@@ -18,6 +18,8 @@ use ops::{Deref, DerefMut};
 use ptr;
 use sys_common::poison::{self, LockResult, TryLockError, TryLockResult};
 use sys_common::rwlock as sys;
+use sync::atomic::AtomicBool;
+use sync::atomic::Ordering::SeqCst;
 
 /// A reader-writer lock
 ///
@@ -107,6 +109,7 @@ unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 pub struct StaticRwLock {
     lock: sys::RWLock,
     poison: poison::Flag,
+    downgrade_flag: AtomicBool,
 }
 
 /// Constant initialization for a statically-initialized rwlock.
@@ -359,6 +362,7 @@ impl StaticRwLock {
         StaticRwLock {
             lock: sys::RWLock::new(),
             poison: poison::Flag::new(),
+            downgrade_flag: AtomicBool::new(false),
         }
     }
 
@@ -396,7 +400,19 @@ impl StaticRwLock {
     #[inline]
     pub fn write(&'static self) -> LockResult<RwLockWriteGuard<'static, ()>> {
         unsafe {
-            self.lock.write();
+            loop {
+                self.lock.write();
+
+                // if another writer is attempting to downgrade,
+                // wait until they have finished before trying to acquire
+                // the lock again.
+                if self.downgrade_flag.load(SeqCst) {
+                    self.lock.write_unlock();
+                    while self.downgrade_flag.load(SeqCst) {}
+                } else {
+                    break;
+                }
+            }
             RwLockWriteGuard::new(self, &DUMMY.0)
         }
     }
@@ -408,10 +424,15 @@ impl StaticRwLock {
     pub fn try_write(&'static self)
                      -> TryLockResult<RwLockWriteGuard<'static, ()>> {
         unsafe {
-            if self.lock.try_write() {
-                Ok(RwLockWriteGuard::new(self, &DUMMY.0)?)
-            } else {
-                Err(TryLockError::WouldBlock)
+            match self.lock.try_write() {
+                // yield to a pending downgrade rather than continuing,
+                // since the downgrade will immediately take hold of a read.
+                true if self.downgrade_flag.load(SeqCst) => {
+                    self.lock.write_unlock();
+                    Err(TryLockError::WouldBlock)
+                }
+                true => Ok(RwLockWriteGuard::new(self, &DUMMY.0)?),
+                false => Err(TryLockError::WouldBlock),
             }
         }
     }
@@ -483,6 +504,80 @@ impl<'rwlock, T: ?Sized> RwLockWriteGuard<'rwlock, T> {
                 __lock: lock,
                 __data: &mut *data.get(),
                 __poison: guard,
+            }
+        })
+    }
+
+    /// Downgrade this guard to read-only access without allowing other writers
+    /// to take exclusive access of the lock in the meantime.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #![feature(guard_downgrade)]
+    /// use std::sync::{Arc, RwLock};
+    /// use std::thread;
+    ///
+    /// let x = Arc::new(RwLock::new(0));
+    /// let mut handles = Vec::new();
+    /// for _ in 0..8 {
+    ///     let x = x.clone();
+    ///     handles.push(thread::spawn(move || {
+    ///         for _ in 0..100 {
+    ///             let mut writer = x.write().unwrap();
+    ///             *writer += 1;
+    ///
+    ///             let cur_val = *writer;
+    ///             let reader = writer.downgrade().unwrap();
+    ///             assert_eq!(cur_val, *reader);
+    ///         }
+    ///     }));
+    /// }
+    /// for handle in handles { handle.join().unwrap() }
+    /// assert_eq!(*x.read().unwrap(), 800);
+    /// ```
+    #[unstable(feature = "guard_downgrade",
+             reason = "recently added, needs RFC for stabilization,
+                       may not be necessary or efficient",
+             issue = "32527")]
+    pub fn downgrade(self) -> LockResult<RwLockReadGuard<'rwlock, T>> {
+        // helper struct to ensure that downgrade flag is turned off even if
+        // this function panics.
+        struct DowngradeGuard<'a> {
+            flag: &'a AtomicBool,
+        }
+
+        impl<'a> Drop for DowngradeGuard<'a> {
+            fn drop(&mut self) {
+                self.flag.store(false, SeqCst);
+            }
+        }
+
+        {
+            // publish intent to downgrade and create a panic-safe guard
+            // for revoking intent before doing lock operations.
+            self.__lock.downgrade_flag.store(true, SeqCst);
+            let _guard = DowngradeGuard { flag: &self.__lock.downgrade_flag };
+
+            unsafe {
+                self.__lock.poison.done(&self.__poison);
+                self.__lock.lock.write_unlock();
+                self.__lock.lock.read();
+            }
+        }
+
+        // read out the relevant fields from the guard and then forget it.
+        // we have already propagated poison and released exclusive access.
+        let (data, lock) = unsafe {
+            (ptr::read(&self.__data), ptr::read(&self.__lock))
+        };
+        mem::forget(self);
+
+
+        poison::map_result(lock.poison.borrow(), move |_| {
+            RwLockReadGuard {
+                __lock: lock,
+                __data: data,
             }
         })
     }
@@ -770,6 +865,58 @@ mod tests {
     }
 
     #[test]
+    fn test_rwlock_downgrade() {
+        let x = Arc::new(RwLock::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let x = x.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let mut writer = x.write().unwrap();
+                    *writer += 1;
+
+                    let cur_val = *writer;
+                    let reader = writer.downgrade().unwrap();
+                    assert!(cur_val == *reader,
+                        "data not consistent before and after writer downgrade");
+                }
+            }));
+        }
+        for handle in handles { handle.join().unwrap() }
+        assert_eq!(*x.read().unwrap(), 800);
+    }
+
+    #[test]
+    fn test_rwlock_downgrade_poison() {
+        struct Foo<'a> {
+            guard: Option<RwLockWriteGuard<'a, ()>>,
+        }
+
+        impl<'a> Drop for Foo<'a> {
+            fn drop(&mut self) {
+                assert!(self.guard.take().unwrap().downgrade().is_err())
+            }
+        }
+
+        let x = Arc::new(RwLock::new(()));
+        let x2 = x.clone();
+        thread::spawn(move || {
+            let _foo = Foo {
+                guard: Some(x2.write().unwrap()),
+            };
+
+            panic!("intentional panic");
+        }).join().unwrap_err();
+
+        assert!(x.write().is_err(),
+            "Poison in downgrading thread not propagated");
+        assert!(match x.try_write() {
+            Err(TryLockError::Poisoned(..)) => true,
+            _ => false,
+        }, "Panic in downgrading thread did not poison.");
+    }
+
+    #[test]
     fn test_into_inner() {
         let m = RwLock::new(NonCopy(10));
         assert_eq!(m.into_inner().unwrap(), NonCopy(10));
@@ -842,7 +989,7 @@ mod tests {
         }).join().unwrap_err();
 
         match rwlock.read() {
-            Ok(r) => panic!("Read lock on poisioned RwLock is Ok: {:?}", &*r),
+            Ok(r) => panic!("Read lock on poisoned RwLock is Ok: {:?}", &*r),
             Err(_) => {}
         };
     }
